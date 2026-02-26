@@ -73,6 +73,9 @@ from gliner2.training.lora import (
     merge_lora_weights, count_lora_parameters, print_lora_info
 )
 
+# Import EWC for continual learning
+from gliner2.training.ewc import EWC
+
 logger = logging.getLogger(__name__)
 
 
@@ -226,6 +229,13 @@ class TrainingConfig:
     lora_dropout: float = 0.0
     lora_target_modules: List[str] = field(default_factory=lambda: ["encoder", "span_rep", "classifier", "count_embed", "count_pred"])
     save_adapter_only: bool = True  # Only applies when use_lora=True
+
+    # EWC Configuration (Elastic Weight Consolidation / Continual Learning)
+    use_ewc: bool = False
+    ewc_lambda: float = 100.0
+    ewc_fisher_samples: Optional[int] = None
+    ewc_normalize_fisher: bool = True
+    ewc_prev_data: Optional[Any] = field(default=None, repr=False)  # Previous task dataset (TrainDataInput)
 
     def __post_init__(self):
         if self.fp16 and self.bf16:
@@ -514,6 +524,7 @@ class GLiNER2Trainer:
             train_data: TrainDataInput = None,
             eval_data: TrainDataInput = None,
             compute_metrics: Optional[Callable] = None,
+            ewc: Optional[EWC] = None,
     ):
         self.model = model
         self.config = config
@@ -546,6 +557,10 @@ class GLiNER2Trainer:
         # LoRA state
         self.lora_layers = {}
         self._setup_lora()
+
+        # EWC state
+        self.ewc: Optional[EWC] = ewc
+        self._maybe_initialize_ewc()
 
     def _setup_seed(self):
         seed = self.config.seed
@@ -654,6 +669,45 @@ class GLiNER2Trainer:
             f"LoRA setup complete: {lora_params:,} trainable params "
             f"out of {total_params:,} total ({percentage:.2f}%)"
         )
+
+    def _maybe_initialize_ewc(self) -> None:
+        """Initialize EWC from config if enabled and previous data is provided."""
+        if not self.config.use_ewc:
+            return
+
+        if self.ewc is not None:
+            logger.info("EWC object provided directly; skipping auto-initialization")
+            return
+
+        if self.config.ewc_prev_data is None:
+            logger.warning(
+                "use_ewc=True but no ewc_prev_data provided; EWC will be disabled"
+            )
+            return
+
+        logger.info("Initializing EWC from ewc_prev_data ...")
+
+        prev_dataset = ExtractorDataset(
+            data=self.config.ewc_prev_data,
+            max_samples=self.config.ewc_fisher_samples if self.config.ewc_fisher_samples else -1,
+            shuffle=False,
+            seed=self.config.seed,
+            validate=False,
+        )
+
+        collator = ExtractorCollator(self.processor, is_training=True)
+
+        self.ewc = EWC(
+            model=self.model,
+            dataset=prev_dataset,
+            data_collator=collator,
+            device=self.device,
+            ewc_lambda=self.config.ewc_lambda,
+            batch_size=self.config.batch_size,
+            num_samples=self.config.ewc_fisher_samples,
+            normalize_fisher=self.config.ewc_normalize_fisher,
+        )
+        logger.info("EWC initialized (lambda=%.1f)", self.config.ewc_lambda)
 
     @property
     def is_main_process(self) -> bool:
@@ -947,6 +1001,10 @@ class GLiNER2Trainer:
                     with autocast(enabled=use_amp, dtype=amp_dtype):
                         outputs = self.model(batch)
                         loss = outputs["total_loss"]
+
+                        # Add EWC regularisation penalty if active
+                        if self.ewc is not None:
+                            loss = loss + self.ewc.ewc_loss(batch_size=self.config.batch_size)
 
                         if self.config.gradient_accumulation_steps > 1:
                             loss = loss / self.config.gradient_accumulation_steps

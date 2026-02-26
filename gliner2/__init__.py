@@ -21,3 +21,4 @@ from .training.lora import (
     merge_lora_weights,
     unmerge_lora_weights,
 )
+from .training.ewc import EWC
